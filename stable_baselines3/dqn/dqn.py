@@ -1,5 +1,6 @@
 import warnings
 from typing import Any, ClassVar, Dict, List, Optional, Tuple, Type, TypeVar, Union
+import sys
 
 import numpy as np
 import torch as th
@@ -46,9 +47,10 @@ class DQN(OffPolicyAlgorithm):
         See https://github.com/DLR-RM/stable-baselines3/issues/37#issuecomment-637501195
     :param target_update_interval: update the target network every ``target_update_interval``
         environment steps.
-    :param exploration_fraction: fraction of entire training period over which the exploration rate is reduced
-    :param exploration_initial_eps: initial value of random action probability
-    :param exploration_final_eps: final value of random action probability
+    :param exploration_strategy: The exploration strategy to use ('eps-greedy', 'softmax'). See section 2.2 in Sutton and Barto for eps-greedy and section 2.8 for softmax description
+    :param exploration_fraction: fraction of entire training period over which the exploration rate (for greedy) or temperature parameter (for softmax) is reduced
+    :param exploration_initial_eps: initial value of random action probability (for greedy). Initial value of temperature parameter (for softmax)
+    :param exploration_final_eps: final value of random action probability (for greedy). Final value for temperature parameter (for softmax)
     :param max_grad_norm: The maximum value for the gradient clipping
     :param stats_window_size: Window size for the rollout logging, specifying the number of episodes to average
         the reported success rate, mean episode length, and mean reward over
@@ -89,6 +91,7 @@ class DQN(OffPolicyAlgorithm):
         replay_buffer_kwargs: Optional[Dict[str, Any]] = None,
         optimize_memory_usage: bool = False,
         target_update_interval: int = 10000,
+        exploration_strategy: str = 'eps-greedy',
         exploration_fraction: float = 0.1,
         exploration_initial_eps: float = 1.0,
         exploration_final_eps: float = 0.05,
@@ -126,7 +129,10 @@ class DQN(OffPolicyAlgorithm):
             supported_action_spaces=(spaces.Discrete,),
             support_multi_env=True,
         )
-
+        if exploration_strategy not in ['eps-greedy', 'softmax']:
+            sys.quit("Only 'eps-greedy' or 'softmax' are supported as exploration strategies")
+        else:
+            self.exploration_strategy = exploration_strategy
         self.exploration_initial_eps = exploration_initial_eps
         self.exploration_final_eps = exploration_final_eps
         self.exploration_fraction = exploration_fraction
@@ -233,7 +239,8 @@ class DQN(OffPolicyAlgorithm):
         deterministic: bool = False,
     ) -> Tuple[np.ndarray, Optional[Tuple[np.ndarray, ...]]]:
         """
-        Overrides the base_class predict function to include epsilon-greedy exploration.
+        Overrides the base_class predict function to include epsilon-greedy exploration
+        and softmax selection.
 
         :param observation: the input observation
         :param state: The last states (can be None, used in recurrent policies)
@@ -242,17 +249,38 @@ class DQN(OffPolicyAlgorithm):
         :return: the model's action and the next state
             (used in recurrent policies)
         """
-        if not deterministic and np.random.rand() < self.exploration_rate:
+        if deterministic:
+            action, state = self.policy.predict(observation, state, episode_start, deterministic)
+        elif self.exploration_strategy=="eps-greedy":
+            if np.random.rand() < self.exploration_rate: #we select action unif at random
+                if self.policy.is_vectorized_observation(observation):
+                    if isinstance(observation, dict):
+                        n_batch = observation[next(iter(observation.keys()))].shape[0]
+                    else:
+                        n_batch = observation.shape[0]
+                    action = np.array([self.action_space.sample() for _ in range(n_batch)])
+                else:
+                    action = np.array(self.action_space.sample())
+            else:  #select the best available strategy (greedy)
+                action, state = self.policy.predict(observation, state, episode_start, deterministic)
+        elif self.exploration_strategy=="softmax":
+            tau = self.exploration_rate
+            action_values = self.policy(observation)
+            max_action_value = np.max(action_values, axis = 1, keepdim = True)[0]/tau
+            action_values = action_values/tau
+            preference = action_values - max_action_value
+            exp_action = np.exp(preference)
+            probs = exp_action/exp_action.sum()
             if self.policy.is_vectorized_observation(observation):
                 if isinstance(observation, dict):
                     n_batch = observation[next(iter(observation.keys()))].shape[0]
                 else:
                     n_batch = observation.shape[0]
-                action = np.array([self.action_space.sample() for _ in range(n_batch)])
+                action = np.multinomial(n_batch, probs) #should have an n_batch here
             else:
-                action = np.array(self.action_space.sample())
+                action = np.multinomial(1, probs) 
         else:
-            action, state = self.policy.predict(observation, state, episode_start, deterministic)
+            sys.quit("exploration strategy is not deterministic, 'eps-greedy', or 'softmax'")
         return action, state
 
     def learn(
